@@ -1,0 +1,81 @@
+FROM ubuntu:16.04
+MAINTAINER Po Cheng <po.cheng@technexion.com>
+
+USER root
+RUN echo "root:root" | chpasswd
+
+ENV DEBIAN_FRONTEND noninteractive
+
+# install required packages
+ARG req_pkgs="default-jre-headless openssh-server xz-utils language-pack-en"
+RUN apt-get -q update && apt-get -q upgrade -y -o Dpkg::Options::="--force-confnew" --no-install-recommends && \
+apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends ${req_pkgs} && \
+apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin
+
+# install extra packages
+ARG extra_pkgs="gcc-multilib g++-multilib build-essential autoconf automake"
+# if git-lfs is to be installed, use curl to get git-lfs scripts and add repository into apt
+RUN case "${extra_pkgs}" in *git-lfs*) \
+apt-get -q update && apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends curl && \
+apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin && \
+curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash;; esac
+RUN apt-get -q update && apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends ${extra_pkgs} && \
+apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin
+
+# install the toolchain and setup buildenv 32/64 bit ARM configuration switcher
+ARG toolchain=""
+COPY *.tar.xz /tmp/
+RUN if [ -n "$toolchain" ]; then \
+for TC in ${toolchain}; do \
+if [ ! -e /tmp/${TC}.tar.xz ]; then \
+wget -q -P /tmp ftp://ftp.technexion.net/development_resources/development_tools/gcc/${TC}.tar.xz; \
+fi; \
+if [ -f /tmp/${TC}.tar.xz ]; then \
+case ${TC} in \
+*sysroot*) tar -C /usr/local -xf /tmp/${TC}.tar.xz;; \
+*) tar -C /opt -xf /tmp/${TC}.tar.xz;; \
+esac; \
+fi; \
+done; \
+printf "#!/bin/bash\nexport DISPLAY=:0\ncase \"\$1\" in\n64)\n\tdeclare -x ARCH=arm64\n\tdeclare -x CROSS_COMPILE=aarch64-linux-gnu-\n\tdeclare -x PATH=/opt/gcc-linaro-6.4.1-2017.11-x86_64_aarch64-linux-gnu/bin/:$PATH\n\t;;\nangstrom)\n\tdeclare -x ARCH=arm\n\tdeclare -x CROSS_COMPILE=arm-none-linux-gnueabi-\n\tdeclare -x PATH=/opt/arm-2010.09/bin:$PATH\n\t;;\n*)\n\tdeclare -x ARCH=arm\n\tdeclare -x CROSS_COMPILE=arm-linux-gnueabihf-\n\tdeclare -x PATH=/opt/gcc-5.1-2015.08-x86_64_arm-linux-gnueabihf/bin:$PATH\n\t;;\nesac\n" > /usr/bin/buildenv.sh && chmod a+x /usr/bin/buildenv.sh; \
+fi; rm /tmp/*.tar.xz;
+
+# Set user jenkins to the docker image
+ARG builder_username="jenkins"
+ARG builder_password="jenkins"
+RUN useradd -m -d /home/${builder_username} -s /bin/bash ${builder_username} && echo "${builder_username}:${builder_password}" | chpasswd && usermod -a -G sudo ${builder_username}
+ADD .ssh /home/${builder_username}/.ssh
+RUN chown -R "${builder_username}:${builder_username}" /home/${builder_username}/.ssh && chmod 700 /home/${builder_username}/.ssh && chmod 600 /home/${builder_username}/.ssh/id_rsa
+
+RUN which sshd && \
+sed -i 's|session    required     pam_loginuid.so|session    optional     pam_loginuid.so|g' /etc/pam.d/sshd && \
+echo "    IdentityFile /home/${builder_username}/.ssh/id_rsa" >> /etc/ssh/ssh_config && \
+mkdir -p /var/run/sshd || true
+
+RUN which git && \
+echo "[user]" >> /home/${builder_username}/.gitconfig && \
+echo "	email = ${builder_username}@technexion.com" >> /home/${builder_username}/.gitconfig && \
+echo "	name = ${builder_username}" >> /home/${builder_username}/.gitconfig || true
+
+# Setup repo and git-lfs symbolic link
+RUN mkdir -p /home/${builder_username}/bin
+RUN which repo && ln -s $(which repo) /home/${builder_username}/bin/repo || true
+RUN which git-lfs && ln -s $(which git-lfs) /home/${builder_username}/bin/git-lfs || true
+
+# Setup environments
+ENV LANG en_US.UTF-8
+RUN locale-gen $LANG && update-locale
+
+ENV HOME /home/${builder_username}
+ENV PATH /home/${builder_username}/bin:$PATH
+RUN env > /etc/environment
+
+# export sshd port
+ARG sshd_port="22"
+EXPOSE ${sshd_port}
+# Default sshd command
+ENV SSHD_PORT ${sshd_port}
+# NOTE: using [ ] does not expand variables, so leave it to bash shell
+# (NOTE: no ENTRYPOINT here)
+CMD /usr/sbin/sshd -p ${SSHD_PORT} -D
+
