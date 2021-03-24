@@ -1,5 +1,6 @@
-FROM ubuntu:16.04
-MAINTAINER Po Cheng <po.cheng@technexion.com>
+ARG ubuntu_version="16.04"
+FROM ubuntu:${ubuntu_version}
+MAINTAINER Po Cheng <pycheng@smileyfish.co.uk>
 
 USER root
 RUN echo "root:root" | chpasswd
@@ -7,7 +8,7 @@ RUN echo "root:root" | chpasswd
 ENV DEBIAN_FRONTEND noninteractive
 
 # install required packages
-ARG req_pkgs="default-jre-headless openssh-server xz-utils language-pack-en"
+ARG req_pkgs="default-jre-headless openssh-server xz-utils language-pack-en curl wget gpg gpg-agent"
 RUN apt-get -q update && apt-get -q upgrade -y -o Dpkg::Options::="--force-confnew" --no-install-recommends && \
 apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends ${req_pkgs} && \
 apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin
@@ -16,34 +17,74 @@ apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && r
 ARG extra_pkgs="gcc-multilib g++-multilib build-essential autoconf automake"
 # if git-lfs is to be installed, use curl to get git-lfs scripts and add repository into apt
 RUN case "${extra_pkgs}" in *git-lfs*) \
-apt-get -q update && apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends curl && \
-apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin && \
 curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash;; esac
 RUN apt-get -q update && apt-get -q install -y -o Dpkg::Options::="--force-confnew" --no-install-recommends ${extra_pkgs} && \
 apt-get -q autoremove && apt-get -q clean -y && rm -rf /var/lib/apt/lists/* && rm -f /var/cache/apt/*.bin
 
 # install the toolchain and setup buildenv 32/64 bit ARM configuration switcher
+# https://releases.linaro.org/components/toolchain/binaries/7.4-2019.02/arm-linux-gnueabihf/gcc-linaro-7.4.1-2019.02-x86_64_arm-linux-gnueabihf.tar.xz
+# https://releases.linaro.org/components/toolchain/binaries/7.4-2019.02/aarch64-linux-gnu/gcc-linaro-7.4.1-2019.02-x86_64_aarch64-linux-gnu.tar.xz
 ARG toolchain=""
 COPY *.tar.xz /tmp/
-RUN if [ -n "$toolchain" ]; then \
-for TC in ${toolchain}; do \
-if [ ! -e /tmp/${TC}.tar.xz ]; then \
-wget -q -P /tmp ftp://ftp.technexion.net/development_resources/development_tools/gcc/${TC}.tar.xz; \
-fi; \
-if [ -f /tmp/${TC}.tar.xz ]; then \
-case ${TC} in \
-*sysroot*) tar -C /usr/local -xf /tmp/${TC}.tar.xz;; \
-*) tar -C /opt -xf /tmp/${TC}.tar.xz;; \
-esac; \
-fi; \
-done; \
-printf "#!/bin/bash\nexport DISPLAY=:0\ncase \"\$1\" in\n64)\n\tdeclare -x ARCH=arm64\n\tdeclare -x CROSS_COMPILE=aarch64-linux-gnu-\n\tdeclare -x PATH=/opt/gcc-linaro-6.4.1-2017.11-x86_64_aarch64-linux-gnu/bin/:$PATH\n\t;;\nangstrom)\n\tdeclare -x ARCH=arm\n\tdeclare -x CROSS_COMPILE=arm-none-linux-gnueabi-\n\tdeclare -x PATH=/opt/arm-2010.09/bin:$PATH\n\t;;\n*)\n\tdeclare -x ARCH=arm\n\tdeclare -x CROSS_COMPILE=arm-linux-gnueabihf-\n\tdeclare -x PATH=/opt/gcc-5.1-2015.08-x86_64_arm-linux-gnueabihf/bin:$PATH\n\t;;\nesac\n" > /usr/bin/buildenv.sh && chmod a+x /usr/bin/buildenv.sh; \
-fi; rm /tmp/*.tar.xz;
+RUN printf "#!/bin/bash\nexport DISPLAY=:0\n" >> /usr/local/bin/buildenv.sh; \
+if [ -n "$toolchain" ]; then \
+  printf "case \"\$1\" in\n" >> /usr/local/bin/buildenv.sh; \
+  for TC in ${toolchain}; do \
+    ver=$(echo ${TC} | cut -d "-" -f 3); \
+    date=$(echo ${TC} | cut -d "-" -f 4); \
+    dir="${ver%.*}-${date}"; \
+    ver=$(echo ${TC} | cut -d "-" -f 3,4); \
+    arch=$(echo ${TC} | cut -d "_" -f 3); \
+    case ${TC} in \
+    *aarch64*) \
+      printf "64)\n\tdeclare -x ARCH=arm64\n" >> /usr/local/bin/buildenv.sh; \
+      ;; \
+    *arm*) \
+      printf "32)\n\tdeclare -x ARCH=arm\n" >> /usr/local/bin/buildenv.sh; \
+      ;; \
+    esac; \
+    if [ ! -e /tmp/${TC}.tar.xz ]; then \
+      wget -q -P /tmp https://releases.linaro.org/components/toolchain/binaries/${dir}/${arch}/${TC}.tar.xz; \
+      tar -C /opt -xf /tmp/${TC}.tar.xz; \
+      printf "\tdeclare -x CROSS_COMPILE=${arch}-\n\tdeclare -x PATH=/opt/gcc-linaro-${ver}-x86_64_${arch}/bin/:$PATH\n;;\n" >> /usr/local/bin/buildenv.sh; \
+    elif [ -f /tmp/${TC}.tar.xz ]; then \
+      case ${TC} in \
+      *sysroot*) \
+        tar -C /usr/local -xf /tmp/${TC}.tar.xz; \
+        ;; \
+      *) \
+        tar -C /opt -xf /tmp/${TC}.tar.xz; \
+        printf "\tdeclare -x CROSS_COMPILE=${arch}-\n\tdeclare -x PATH=/opt/gcc-linaro-${ver}-x86_64_${arch}/bin/:$PATH\n;;\n" >> /usr/local/bin/buildenv.sh; \
+        ;; \
+      esac \
+    else \
+      echo "no /tmp/${TC}.tar.xz"; \
+    fi; \
+  done; \
+  printf "angstrom)\n\tdeclare -x ARCH=arm\n\tdeclare -x CROSS_COMPILE=arm-none-linux-gnueabi-\n\tdeclare -x PATH=/opt/arm-2010.09/bin:$PATH\n\t;;\n*)\n\t;;\nesac\n" >> /usr/local/bin/buildenv.sh; \
+  chmod a+x /usr/local/bin/buildenv.sh; \
+fi; rm -rf /tmp/*.tar.xz; cat /usr/local/bin/buildenv.sh;
+
+# Install JQ
+ARG JQ_VERSION='1.5'
+RUN wget --no-check-certificate https://raw.githubusercontent.com/stedolan/jq/master/sig/jq-release.key -O /tmp/jq-release.key && \
+    wget --no-check-certificate https://raw.githubusercontent.com/stedolan/jq/master/sig/v${JQ_VERSION}/jq-linux64.asc -O /tmp/jq-linux64.asc && \
+    wget --no-check-certificate https://github.com/stedolan/jq/releases/download/jq-${JQ_VERSION}/jq-linux64 -O /tmp/jq-linux64 && \
+    gpg --import /tmp/jq-release.key && \
+    gpg --verify /tmp/jq-linux64.asc /tmp/jq-linux64 && \
+    cp /tmp/jq-linux64 /usr/bin/jq && \
+    chmod +x /usr/bin/jq && \
+    rm -f /tmp/jq-release.key && \
+    rm -f /tmp/jq-linux64.asc && \
+    rm -f /tmp/jq-linux64
 
 # Set user jenkins to the docker image
 ARG builder_username="jenkins"
 ARG builder_password="jenkins"
-RUN useradd -m -d /home/${builder_username} -s /bin/bash ${builder_username} && echo "${builder_username}:${builder_password}" | chpasswd && usermod -a -G sudo ${builder_username}
+ARG domain_name="smileyfish.co.uk"
+RUN useradd -m -d /home/${builder_username} -s /bin/bash ${builder_username} && echo "${builder_username}:${builder_password}" && echo "${builder_username}:${builder_password}" | chpasswd && usermod -a -G sudo ${builder_username}
+
+# Setup ssh keys
 ADD .ssh /home/${builder_username}/.ssh
 RUN chown -R "${builder_username}:${builder_username}" /home/${builder_username}/.ssh && chmod 700 /home/${builder_username}/.ssh && chmod 600 /home/${builder_username}/.ssh/id_rsa
 
@@ -52,15 +93,22 @@ sed -i 's|session    required     pam_loginuid.so|session    optional     pam_lo
 echo "    IdentityFile /home/${builder_username}/.ssh/id_rsa" >> /etc/ssh/ssh_config && \
 mkdir -p /var/run/sshd || true
 
+# Setup git config
 RUN which git && \
 echo "[user]" >> /home/${builder_username}/.gitconfig && \
-echo "	email = ${builder_username}@technexion.com" >> /home/${builder_username}/.gitconfig && \
+echo "	email = ${builder_username}@${domain_name}" >> /home/${builder_username}/.gitconfig && \
 echo "	name = ${builder_username}" >> /home/${builder_username}/.gitconfig || true
 
-# Setup repo and git-lfs symbolic link
+# Setup repo
 RUN mkdir -p /home/${builder_username}/bin
-RUN which repo && ln -s $(which repo) /home/${builder_username}/bin/repo || true
-RUN which git-lfs && ln -s $(which git-lfs) /home/${builder_username}/bin/git-lfs || true
+RUN curl https://storage.googleapis.com/git-repo-downloads/repo > /home/${builder_username}/bin/repo && chmod a+x /home/${builder_username}/bin/repo
+
+# install docker binary
+ARG docker_version="19.03.8"
+# `getent group docker | cut -d: -f3` on the host
+ARG docker_group_id="133"
+RUN wget -q -P /tmp https://download.docker.com/linux/static/stable/$(uname -m)/docker-${docker_version}.tgz && tar -zxf /tmp/docker-${docker_version}.tgz --directory /tmp/ && cp /tmp/docker/docker /home/${builder_username}/bin; rm -rf /tmp/docker*
+RUN if [ -x /home/${builder_username}/bin/docker -a -n "$docker_group_id" ]; then groupadd -g ${docker_group_id} docker && gpasswd -a ${builder_username} docker; fi
 
 # Setup environments
 ENV LANG en_US.UTF-8
